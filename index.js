@@ -23,22 +23,22 @@ function calculateArbitrage(polyPrices, kalshiPrices) {
     throw new Error('Invalid price format');
   }
 
-  // Extract prices
   const [polyYes, polyNo] = polyPrices;
   const [kalshiYes, kalshiNo] = kalshiPrices;
 
-  // Calculate potential arbitrage opportunities:
-  // 1. Buy Yes on Platform A, Buy No on Platform B
-  // 2. Buy No on Platform A, Buy Yes on Platform B
+  // Calculate potential arbitrage opportunities
   const arbitrage1 = 1 - (polyYes + kalshiNo);  // Buy Yes on Poly, No on Kalshi
   const arbitrage2 = 1 - (polyNo + kalshiYes);  // Buy No on Poly, Yes on Kalshi
 
-  // Return the better opportunity if it exists
+  // Add minimum threshold for meaningful arbitrage (e.g., 2%)
+  const MIN_ARBITRAGE = 0.01;
+  // Add maximum threshold to filter out likely mismatches (e.g., 20%)
+  const MAX_ARBITRAGE = 0.50;
+
   const bestArbitrage = Math.max(arbitrage1, arbitrage2);
   
-  // Return object with detailed information
   return {
-    hasArbitrage: bestArbitrage > 0,
+    hasArbitrage: bestArbitrage > MIN_ARBITRAGE && bestArbitrage < MAX_ARBITRAGE,
     amount: bestArbitrage,
     strategy: bestArbitrage === arbitrage1 ? 
       'Buy Yes on Polymarket, No on Kalshi' : 
@@ -50,7 +50,7 @@ async function fetchAllPolymarketEvents() {
   const allEvents = [];
   const limit = 12;
   let offset = 0;
-  const MAX_EVENTS = 500;
+  const MAX_EVENTS = 1000;
 
   while (allEvents.length < MAX_EVENTS) {
     try {
@@ -96,7 +96,7 @@ async function fetchAllKalshiEvents() {
   const allEvents = [];
   const pageSize = 100;
   let pageNumber = 1;
-  const MAX_EVENTS = 500;
+  const MAX_EVENTS = 1000;
 
   while (allEvents.length < MAX_EVENTS) {
     try {
@@ -195,49 +195,119 @@ function areMarketsMatching(market1, market2) {
   const similarity = stringSimilarity.compareTwoStrings(market1.toLowerCase(), market2.toLowerCase());
   
   return {
-    isMatch: similarity > 0.8 && numbersMatch && datesMatch && yearsMatch,
+    isMatch: similarity > 0.7 && numbersMatch && datesMatch && yearsMatch,
     similarity
+  };
+}
+
+// Add new helper functions for better matching
+function extractKeywords(title) {
+  // Remove common words and punctuation
+  const cleanTitle = title.toLowerCase()
+    .replace(/[^\w\s]/g, '')
+    .replace(/\b(will|the|be|in|by|at|on|for|of|to|and|or|a|an)\b/g, '')
+    .trim();
+  
+  // Extract key terms
+  return cleanTitle.split(' ').filter(word => word.length > 2);
+}
+
+function getMarketType(title) {
+  const types = {
+    crypto: ['bitcoin', 'btc', 'ethereum', 'eth', 'crypto'],
+    politics: ['election', 'president', 'senate', 'house', 'congress', 'democrat', 'republican', 'trump', 'biden'],
+    sports: ['win', 'league', 'championship', 'cup', 'game', 'match'],
+    finance: ['rate', 'fed', 'interest', 'market', 'price', 'index']
+  };
+
+  title = title.toLowerCase();
+  for (const [type, keywords] of Object.entries(types)) {
+    if (keywords.some(keyword => title.includes(keyword))) {
+      return type;
+    }
+  }
+  return 'other';
+}
+
+function compareMarkets(market1, market2) {
+  const title1 = market1.title.toLowerCase();
+  const title2 = market2.title.toLowerCase();
+
+  // Check if they're the same type of market
+  if (getMarketType(title1) !== getMarketType(title2)) {
+    return { isMatch: false, confidence: 0 };
+  }
+
+  // Extract keywords from both titles
+  const keywords1 = extractKeywords(title1);
+  const keywords2 = extractKeywords(title2);
+
+  // Calculate keyword overlap - require more common keywords
+  const commonKeywords = keywords1.filter(word => keywords2.includes(word));
+  const keywordScore = commonKeywords.length / Math.max(keywords1.length, keywords2.length);
+
+  // More strict string similarity
+  const similarity = stringSimilarity.compareTwoStrings(title1, title2);
+
+  // Combined confidence score with higher threshold
+  const confidence = (keywordScore * 0.5) + (similarity * 0.5);
+  
+  // More strict matching criteria
+  return {
+    isMatch: confidence > 0.7 && commonKeywords.length >= 3, // Require at least 3 common keywords
+    confidence,
+    commonKeywords
   };
 }
 
 app.get('/api/arbitrage', async (req, res) => {
   try {
+    console.log('\n=== Starting Market Fetch ===');
     const [polymarketData, kalshiData] = await Promise.all([
       fetchAllPolymarketEvents(),
       fetchAllKalshiEvents()
     ]);
 
-    // Group markets by category
-    const polymarketMarkets = polymarketData.flatMap(event => 
-      event.markets.filter(market => market.outcomePrices).map(market => ({
-        title: market.question,
-        category: categorizeMarket(market.question),
-        market: market
-      }))
-    );
+    // Extract markets and remove duplicates
+    const polymarketMarkets = Array.from(new Set(
+      polymarketData.flatMap(event => 
+        event.markets.filter(market => market.outcomePrices).map(market => ({
+          title: market.question,
+          type: getMarketType(market.question),
+          market: market
+        }))
+      ).map(m => JSON.stringify(m))
+    )).map(str => JSON.parse(str));
 
-    const kalshiMarkets = kalshiData.flatMap(event => 
-      event.markets.filter(market => market.yes_bid !== undefined).map(market => ({
-        title: market.title,
-        category: categorizeMarket(market.title),
-        market: market
-      }))
-    );
+    const kalshiMarkets = Array.from(new Set(
+      kalshiData.flatMap(event => 
+        event.markets.filter(market => market.yes_bid !== undefined).map(market => ({
+          title: market.title,
+          type: getMarketType(market.title),
+          market: market
+        }))
+      ).map(m => JSON.stringify(m))
+    )).map(str => JSON.parse(str));
+
+    console.log(`Found ${polymarketMarkets.length} unique Polymarket markets`);
+    console.log(`Found ${kalshiMarkets.length} unique Kalshi markets`);
 
     const matches = [];
+    console.log('\n=== Finding Matches ===');
     
-    // Find matches within each category
+    // Find matches using comparison logic
     for (const polyMarket of polymarketMarkets) {
-      const sameCategory = kalshiMarkets.filter(k => k.category === polyMarket.category);
+      const sameTypeMarkets = kalshiMarkets.filter(k => k.type === polyMarket.type);
       
-      for (const kalshiMarket of sameCategory) {
-        const { isMatch, similarity } = areMarketsMatching(polyMarket.title, kalshiMarket.title);
+      for (const kalshiMarket of sameTypeMarkets) {
+        const { isMatch, confidence, commonKeywords } = compareMarkets(polyMarket, kalshiMarket);
         
         if (isMatch) {
           matches.push({
             polymarket: polyMarket,
             kalshi: kalshiMarket,
-            similarity
+            confidence,
+            commonKeywords
           });
         }
       }
@@ -250,42 +320,24 @@ app.get('/api/arbitrage', async (req, res) => {
       try {
         const polyOutcomes = JSON.parse(match.polymarket.market.outcomes);
         const polyPrices = JSON.parse(match.polymarket.market.outcomePrices).map(price => parseFloat(price));
-
-        console.log('\nProcessing match:', match.polymarket.title);
-        console.log('Polymarket outcomes:', polyOutcomes);
-        console.log('Polymarket raw prices:', polyPrices);
-
-        const polyYesPrice = polyPrices[0];  // YES is first
-        const polyNoPrice = polyPrices[1];   // NO is second
-
         const kalshiPrices = [
           match.kalshi.market.yes_bid / 100,
           (100 - match.kalshi.market.yes_bid) / 100
         ];
 
-        console.log('Final prices:');
-        console.log('Polymarket Yes/No:', [polyYesPrice, polyNoPrice]);
-        console.log('Kalshi Yes/No:', kalshiPrices);
-
         const arbitrage = calculateArbitrage(
-          [polyYesPrice, polyNoPrice],
+          [polyPrices[0], polyPrices[1]],
           kalshiPrices
         );
 
-        console.log('Arbitrage analysis:', arbitrage);
-
-        // Skip if no arbitrage or if arbitrage is unrealistically high (>50%)
-        if (!arbitrage.hasArbitrage || arbitrage.amount > 0.5) {
-          console.log('No valid arbitrage opportunity found');
-          return null;
-        }
+        if (!arbitrage.hasArbitrage) return null;
 
         return {
           polymarket: {
             title: match.polymarket.market.question,
             prices: {
-              yes: polyYesPrice,
-              no: polyNoPrice
+              yes: polyPrices[0],
+              no: polyPrices[1]
             },
             volume: parseFloat(match.polymarket.market.volume24hr) || 0
           },
@@ -300,10 +352,9 @@ app.get('/api/arbitrage', async (req, res) => {
           potentialProfit: arbitrage.amount * 100,
           strategy: arbitrage.strategy,
           priceDifference: {
-            yes: (polyYesPrice - kalshiPrices[0]) * 100,
-            no: (polyNoPrice - kalshiPrices[1]) * 100
-          },
-          similarity: match.similarity
+            yes: (polyPrices[0] - kalshiPrices[0]) * 100,
+            no: (polyPrices[1] - kalshiPrices[1]) * 100
+          }
         };
       } catch (error) {
         console.error('Error processing match:', error);
@@ -311,14 +362,14 @@ app.get('/api/arbitrage', async (req, res) => {
       }
     }).filter(Boolean);
 
-    // Sort by potential profit (but only including realistic opportunities)
+    console.log(`Found ${arbitrageOpportunities.length} valid arbitrage opportunities`);
+    
     const sortedOpportunities = arbitrageOpportunities
       .sort((a, b) => b.potentialProfit - a.potentialProfit);
-
-    console.log(`Found ${sortedOpportunities.length} valid arbitrage opportunities (<=50%)`);
     
     res.json(sortedOpportunities);
   } catch (error) {
+    console.error('\n=== Error ===');
     console.error('Server error:', error);
     res.status(500).json({ error: error.message || 'Failed to process markets' });
   }
