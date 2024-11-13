@@ -4,12 +4,18 @@ const cors = require('cors');
 const fetch = require('node-fetch');
 const Anthropic = require('@anthropic-ai/sdk');
 const stringSimilarity = require('string-similarity');
+const OpenAI = require('openai');
 
 const app = express();
 const port = 3001;
 
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
+});
+
+const client = new OpenAI({
+  apiKey: process.env.PERPLEXITY_API_KEY,
+  baseURL: "https://api.perplexity.ai"
 });
 
 app.use(cors());
@@ -47,15 +53,24 @@ function calculateArbitrage(polyPrices, kalshiPrices) {
 }
 
 async function fetchAllPolymarketEvents() {
-  const allEvents = [];
-  const limit = 12;
+  const allMarkets = [];
+  const limit = 100;
   let offset = 0;
-  const MAX_EVENTS = 1000;
+  const MAX_MARKETS = 1000;
 
-  while (allEvents.length < MAX_EVENTS) {
+  while (allMarkets.length < MAX_MARKETS) {
     try {
+      console.log(`\nFetching Polymarket markets with offset ${offset}...`);
       const response = await fetch(
-        `https://gamma-api.polymarket.com/events?limit=${limit}&active=true&archived=false&closed=false&order=volume24hr&ascending=false&offset=${offset}`,
+        `https://gamma-api.polymarket.com/markets?` + 
+        `limit=${limit}` +
+        `&offset=${offset}` +
+        `&active=true` +
+        `&archived=false` +
+        `&closed=false` +
+        `&order=volume24hr` +
+        `&ascending=false` +
+        `&volume_num_min=1000`,  // Only markets with significant volume
         {
           headers: {
             'accept': 'application/json',
@@ -68,19 +83,27 @@ async function fetchAllPolymarketEvents() {
         throw new Error(`HTTP error! status: ${response.status}`);
       }
 
-      const events = await response.json();
+      const markets = await response.json();
       
-      if (!events || events.length === 0) break;
+      if (!markets || markets.length === 0) {
+        console.log('No more markets found');
+        break;
+      }
 
-      const validEvents = events.filter(event => 
-        event.markets && 
-        event.markets.length > 0 && 
-        event.markets.some(market => market.outcomePrices)
+      const validMarkets = markets.filter(market => 
+        market.outcomePrices && 
+        !market.question.toLowerCase().includes('kamala harris') &&
+        market.volume24hr > 1000  // Double check volume requirement
       );
 
-      allEvents.push(...validEvents.slice(0, MAX_EVENTS - allEvents.length));
+      console.log(`Found ${validMarkets.length} valid markets in this batch`);
       
-      if (allEvents.length >= MAX_EVENTS) break;
+      allMarkets.push(...validMarkets.slice(0, MAX_MARKETS - allMarkets.length));
+      
+      if (allMarkets.length >= MAX_MARKETS) {
+        console.log('Reached maximum market limit');
+        break;
+      }
       
       offset += limit;
     } catch (error) {
@@ -89,7 +112,15 @@ async function fetchAllPolymarketEvents() {
     }
   }
 
-  return allEvents;
+  // Transform markets into expected format
+  return [{
+    markets: allMarkets.map(market => ({
+      question: market.question,
+      outcomePrices: market.outcomePrices,
+      volume24hr: market.volume24hr,
+      outcomes: market.outcomes
+    }))
+  }];
 }
 
 async function fetchAllKalshiEvents() {
@@ -137,67 +168,6 @@ async function fetchAllKalshiEvents() {
   }
 
   return allEvents;
-}
-
-function normalizeTitle(title) {
-  return title.toLowerCase()
-    .replace(/[^a-z0-9\s]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-// Market categorization functions
-function categorizeMarket(title) {
-  title = title.toLowerCase();
-  if (title.includes('bitcoin') || title.includes('ethereum') || title.includes('btc') || title.includes('eth')) {
-    return 'crypto';
-  }
-  if (title.includes('win') && (title.includes('house') || title.includes('senate') || title.includes('president'))) {
-    return 'elections';
-  }
-  if (title.includes('premier league') || title.includes('la liga')) {
-    return 'sports';
-  }
-  return 'other';
-}
-
-// Extract specific details from titles
-function extractDetails(title) {
-  const numbers = title.match(/\$?\d+([.,]\d+)?/g) || [];
-  const dates = title.match(/\b(january|february|march|april|may|june|july|august|september|october|november|december)\b/gi) || [];
-  const years = title.match(/\b20\d{2}\b/g) || [];
-  
-  return {
-    numbers: numbers.map(n => parseFloat(n.replace('$', ''))),
-    dates,
-    years
-  };
-}
-
-// Check if two markets are about the same event
-function areMarketsMatching(market1, market2) {
-  const details1 = extractDetails(market1);
-  const details2 = extractDetails(market2);
-  
-  // Check if numerical values match
-  const numbersMatch = details1.numbers.length === details2.numbers.length &&
-    details1.numbers.every(n => details2.numbers.includes(n));
-  
-  // Check if dates match
-  const datesMatch = details1.dates.length === details2.dates.length &&
-    details1.dates.every(d => details2.dates.some(d2 => d.toLowerCase() === d2.toLowerCase()));
-  
-  // Check if years match
-  const yearsMatch = details1.years.length === details2.years.length &&
-    details1.years.every(y => details2.years.includes(y));
-  
-  // Calculate string similarity
-  const similarity = stringSimilarity.compareTwoStrings(market1.toLowerCase(), market2.toLowerCase());
-  
-  return {
-    isMatch: similarity > 0.7 && numbersMatch && datesMatch && yearsMatch,
-    similarity
-  };
 }
 
 // Add new helper functions for better matching
@@ -254,10 +224,117 @@ function compareMarkets(market1, market2) {
   
   // More strict matching criteria
   return {
-    isMatch: confidence > 0.7 && commonKeywords.length >= 3, // Require at least 3 common keywords
+    isMatch: confidence > 0.65 && commonKeywords.length >= 2, // Require at least 3 common keywords
     confidence,
     commonKeywords
   };
+}
+
+async function findAlgorithmMatches(polymarketMarkets, kalshiMarkets) {
+  const matches = [];
+  console.log('\n=== Finding Algorithm Matches ===');
+  
+  for (const polyMarket of polymarketMarkets) {
+    const sameTypeMarkets = kalshiMarkets.filter(k => k.type === polyMarket.type);
+    
+    for (const kalshiMarket of sameTypeMarkets) {
+      const { isMatch, confidence, commonKeywords } = compareMarkets(polyMarket, kalshiMarket);
+      
+      if (isMatch) {
+        matches.push({
+          polymarket: polyMarket,
+          kalshi: kalshiMarket,
+          confidence,
+          commonKeywords,
+          source: 'algorithm'
+        });
+      }
+    }
+  }
+
+  console.log(`Found ${matches.length} algorithm matches`);
+  return matches;
+}
+
+// Also need to add the calculateArbitrageForMatch function
+function calculateArbitrageForMatch(match) {
+  try {
+    const polyPrices = JSON.parse(match.polymarket.market.outcomePrices).map(price => parseFloat(price));
+    const kalshiPrices = [
+      match.kalshi.market.yes_bid / 100,
+      (100 - match.kalshi.market.yes_bid) / 100
+    ];
+
+    const arbitrage = calculateArbitrage(
+      [polyPrices[0], polyPrices[1]],
+      kalshiPrices
+    );
+
+    if (!arbitrage.hasArbitrage) return null;
+
+    return {
+      polymarket: {
+        title: match.polymarket.market.question,
+        prices: {
+          yes: polyPrices[0],
+          no: polyPrices[1]
+        },
+        volume: parseFloat(match.polymarket.market.volume24hr) || 0
+      },
+      kalshi: {
+        title: match.kalshi.market.title,
+        prices: {
+          yes: kalshiPrices[0],
+          no: kalshiPrices[1]
+        },
+        volume: parseFloat(match.kalshi.market.dollar_recent_volume) || 0
+      },
+      potentialProfit: arbitrage.amount * 100,
+      strategy: arbitrage.strategy,
+      priceDifference: {
+        yes: (polyPrices[0] - kalshiPrices[0]) * 100,
+        no: (polyPrices[1] - kalshiPrices[1]) * 100
+      },
+      source: match.source
+    };
+  } catch (error) {
+    console.error('Error calculating arbitrage for match:', error);
+    return null;
+  }
+}
+
+// Add Perplexity analysis function
+async function getPerplexityAnalysis(question) {
+  try {
+    const messages = [
+      {
+        role: "user",
+        content: `Analyze this prediction market question: "${question}".
+
+Provide a detailed analysis in markdown format:
+
+1. Historical Context & Background
+2. Key Statistics & Data Points
+3. Market Sentiment Analysis
+4. Risk Factors
+5. Final Verdict
+
+Keep response under 300 words but be thorough.`
+      }
+    ];
+
+    const response = await client.chat.completions.create({
+      model: "llama-3.1-sonar-large-128k-online",
+      messages: messages,
+      temperature: 0.2,
+      max_tokens: 1000
+    });
+
+    return response.choices[0].message.content;
+  } catch (error) {
+    console.error('Perplexity analysis error:', error);
+    return null;
+  }
 }
 
 app.get('/api/arbitrage', async (req, res) => {
@@ -268,106 +345,73 @@ app.get('/api/arbitrage', async (req, res) => {
       fetchAllKalshiEvents()
     ]);
 
-    // Extract markets and remove duplicates
+    // Extract markets and filter out Kamala Harris titles
     const polymarketMarkets = Array.from(new Set(
       polymarketData.flatMap(event => 
-        event.markets.filter(market => market.outcomePrices).map(market => ({
-          title: market.question,
-          type: getMarketType(market.question),
-          market: market
-        }))
+        (event?.markets || [])  // Add null check
+          .filter(market => market && market.outcomePrices)
+          .filter(market => !market.question?.toLowerCase().includes('kamala harris'))
+          .map(market => ({
+            title: market.question,
+            type: getMarketType(market.question),
+            market: market
+          }))
       ).map(m => JSON.stringify(m))
     )).map(str => JSON.parse(str));
 
     const kalshiMarkets = Array.from(new Set(
       kalshiData.flatMap(event => 
-        event.markets.filter(market => market.yes_bid !== undefined).map(market => ({
-          title: market.title,
-          type: getMarketType(market.title),
-          market: market
-        }))
+        (event?.markets || [])  // Add null check
+          .filter(market => market && market.yes_bid !== undefined)
+          .filter(market => !market.title?.toLowerCase().includes('kamala harris'))
+          .map(market => ({
+            title: market.title,
+            type: getMarketType(market.title),
+            market: market
+          }))
       ).map(m => JSON.stringify(m))
     )).map(str => JSON.parse(str));
 
-    console.log(`Found ${polymarketMarkets.length} unique Polymarket markets`);
-    console.log(`Found ${kalshiMarkets.length} unique Kalshi markets`);
-
-    const matches = [];
-    console.log('\n=== Finding Matches ===');
-    
-    // Find matches using comparison logic
-    for (const polyMarket of polymarketMarkets) {
-      const sameTypeMarkets = kalshiMarkets.filter(k => k.type === polyMarket.type);
-      
-      for (const kalshiMarket of sameTypeMarkets) {
-        const { isMatch, confidence, commonKeywords } = compareMarkets(polyMarket, kalshiMarket);
-        
-        if (isMatch) {
-          matches.push({
-            polymarket: polyMarket,
-            kalshi: kalshiMarket,
-            confidence,
-            commonKeywords
-          });
-        }
-      }
-    }
-
+    // Find matches using algorithm
+    const matches = await findAlgorithmMatches(polymarketMarkets, kalshiMarkets);
     console.log(`Found ${matches.length} potential matches`);
 
     // Calculate arbitrage for matches
-    const arbitrageOpportunities = matches.map(match => {
-      try {
-        const polyOutcomes = JSON.parse(match.polymarket.market.outcomes);
-        const polyPrices = JSON.parse(match.polymarket.market.outcomePrices).map(price => parseFloat(price));
-        const kalshiPrices = [
-          match.kalshi.market.yes_bid / 100,
-          (100 - match.kalshi.market.yes_bid) / 100
-        ];
+    const arbitrageOpportunities = await Promise.all(
+      matches.map(async match => {
+        if (!match?.polymarket?.market || !match?.kalshi?.market) {
+          return null;
+        }
+        const opportunity = calculateArbitrageForMatch(match);
+        if (opportunity) {
+          // Get analysis for the market
+          opportunity.analysis = await getPerplexityAnalysis(opportunity.polymarket.title);
+        }
+        return opportunity;
+      })
+    );
 
-        const arbitrage = calculateArbitrage(
-          [polyPrices[0], polyPrices[1]],
-          kalshiPrices
-        );
+    // Filter out null values and duplicates
+    const validOpportunities = arbitrageOpportunities.filter(opp => 
+      opp && opp.polymarket && opp.kalshi
+    );
 
-        if (!arbitrage.hasArbitrage) return null;
-
-        return {
-          polymarket: {
-            title: match.polymarket.market.question,
-            prices: {
-              yes: polyPrices[0],
-              no: polyPrices[1]
-            },
-            volume: parseFloat(match.polymarket.market.volume24hr) || 0
-          },
-          kalshi: {
-            title: match.kalshi.market.title,
-            prices: {
-              yes: kalshiPrices[0],
-              no: kalshiPrices[1]
-            },
-            volume: parseFloat(match.kalshi.market.dollar_recent_volume) || 0
-          },
-          potentialProfit: arbitrage.amount * 100,
-          strategy: arbitrage.strategy,
-          priceDifference: {
-            yes: (polyPrices[0] - kalshiPrices[0]) * 100,
-            no: (polyPrices[1] - kalshiPrices[1]) * 100
-          }
-        };
-      } catch (error) {
-        console.error('Error processing match:', error);
-        return null;
+    // Remove duplicates based on Polymarket title
+    const seenTitles = new Set();
+    const uniqueOpportunities = validOpportunities.filter(opp => {
+      const normalizedTitle = opp.polymarket.title.toLowerCase().trim();
+      if (seenTitles.has(normalizedTitle)) {
+        return false;
       }
-    }).filter(Boolean);
+      seenTitles.add(normalizedTitle);
+      return true;
+    });
 
-    console.log(`Found ${arbitrageOpportunities.length} valid arbitrage opportunities`);
+    console.log(`Found ${validOpportunities.length} total opportunities`);
+    console.log(`Removed ${validOpportunities.length - uniqueOpportunities.length} duplicates`);
+    console.log(`Final count: ${uniqueOpportunities.length} unique opportunities`);
     
-    const sortedOpportunities = arbitrageOpportunities
-      .sort((a, b) => b.potentialProfit - a.potentialProfit);
-    
-    res.json(sortedOpportunities);
+    res.json(uniqueOpportunities.sort((a, b) => b.potentialProfit - a.potentialProfit));
   } catch (error) {
     console.error('\n=== Error ===');
     console.error('Server error:', error);
